@@ -11,76 +11,99 @@ import (
 
 func main() {
 	filename := os.Args[1]
+	trimName := strings.Split(strings.TrimSuffix(filename, "/"), "/")
+	staticName := "@" + trimName[len(trimName)-1]
+	outFile := ""
+	files := []string{}
 
-	// input file
-	file, err := os.Open(filename)
-	if err != nil {
-		fmt.Println("Error reading filename: ", err)
-		return
+	switch {
+	case strings.HasSuffix(filename, ".vm"):
+		outFile = strings.TrimSuffix(filename, "vm") + "asm"
+		files = append(files, filename)
+		staticName = strings.TrimSuffix(staticName, "vm")
+	default:
+		outFile = filename + "/" + trimName[len(trimName)-1] + ".asm"
+		dirFiles, err := os.ReadDir(filename)
+		if err != nil {
+			log.Fatal(err)
+		}
+		for _, f := range dirFiles {
+			if strings.HasSuffix(f.Name(), ".vm") {
+				files = append(files, filename+"/"+f.Name())
+			}
+		}
+		staticName += "."
 	}
-	defer file.Close()
+
+	fmt.Printf("Translating %s\n", filename)
+	fmt.Printf("Assembly code at %s\n", outFile)
 
 	// output file
-	outFile := strings.TrimSuffix(filename, "vm") + "asm"
 	ofile, err := os.OpenFile(outFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		log.Println(err)
 	}
 	defer ofile.Close()
 
-	fmt.Printf("Translating %s\n", filename)
-	fmt.Printf("Assembly code at %s\n", outFile)
+	fmt.Printf("Static name %s\n", staticName)
 
-	// static name
-	trimName := strings.Split(filename, "/")
-	staticName := "@" + strings.TrimSuffix(trimName[len(trimName)-1], "vm")
-
-	p := NewParser(file)
 	w := NewCodeWriter(ofile, staticName)
+	w.bootstrap()
 
-	pass := bufio.NewScanner(p.stream)
-	for pass.Scan() {
-		line := pass.Text()
-		if len(line) > 0 && line != "\n" && line[0:2] != "//" {
-			p.current = line
-			w.writeComment(p.current)
-			cmdType := p.commandType()
-			switch {
-			case cmdType == "C_ARITHMETIC":
-				command := p.arg1()
-				w.writeArithmetic(command)
-			case cmdType == "C_PUSH" || cmdType == "C_POP":
-				segment := p.arg1()
-				index := p.arg2()
-				if err != nil {
-					log.Println(err)
+	for _, f := range files {
+		// input file
+		file, err := os.Open(f)
+		if err != nil {
+			fmt.Println("Error reading filename: ", err)
+			return
+		}
+		defer file.Close()
+
+		p := NewParser(file)
+		sn := strings.Split(strings.TrimSuffix(f, "vm"), "/")
+		w.staticName = "@" + sn[len(sn)-1]
+
+		pass := bufio.NewScanner(p.stream)
+		for pass.Scan() {
+			line := pass.Text()
+			if len(line) > 0 && line != "\n" && line[0:2] != "//" {
+				p.current = line
+				w.writeComment(p.current)
+				cmdType := p.commandType()
+				switch {
+				case cmdType == "C_ARITHMETIC":
+					command := p.arg1()
+					w.writeArithmetic(command)
+				case cmdType == "C_PUSH" || cmdType == "C_POP":
+					segment := p.arg1()
+					index := p.arg2()
+					if err != nil {
+						log.Println(err)
+					}
+					w.writePushPop(cmdType, segment, index)
+				case cmdType == "C_LABEL":
+					label := p.arg1()
+					w.writeLabel(label)
+				case cmdType == "C_GOTO":
+					label := p.arg1()
+					w.writeGoto(label)
+				case cmdType == "C_IF":
+					label := p.arg1()
+					w.writeIf(label)
+				case cmdType == "C_FUNCTION":
+					fnName := p.arg1()
+					nVars := p.arg2()
+					w.writeFunction(fnName, nVars)
+				case cmdType == "C_CALL":
+					fnName := p.arg1()
+					nArgs := p.arg2()
+					w.writeCall(fnName, nArgs)
+				case cmdType == "C_RETURN":
+					w.writeReturn()
 				}
-				w.writePushPop(cmdType, segment, index)
-			case cmdType == "C_LABEL":
-				label := p.arg1()
-				w.writeLabel(label)
-			case cmdType == "C_GOTO":
-				label := p.arg1()
-				w.writeGoto(label)
-			case cmdType == "C_IF":
-				label := p.arg1()
-				w.writeIf(label)
-				/*
-					case cmdType == "C_FUNCTION":
-						fnName := p.arg1()
-						nVars := p.arg2()
-						w.writeFunction(fnName, nVars)
-					case cmdType == "C_CALL":
-						fnName := p.arg1()
-						nArgs := p.arg2()
-						w.writeCall(fnName, nArgs)
-					case cmdType == "C_RETURN":
-						w.writeReturn()
-				*/
 			}
 		}
 	}
-	w.writeInfiniteLoop()
 }
 
 // Parser holds the input stream for parsing and current command
@@ -150,6 +173,7 @@ type CodeWriter struct {
 	stream     *os.File
 	staticName string
 	jumpCount  int
+	retCount   int
 }
 
 // NewCodeWriter creates a new CodeWriter
@@ -260,22 +284,81 @@ func (c *CodeWriter) writeGoto(s string) {
 
 // write a conditional jump in assembly, based on results in stack
 func (c *CodeWriter) writeIf(s string) {
-	asm := decrementSP() + "\tA=M\n\tD=M\n\t@" + s + "\n\tD;JNE\n"
+	asm := popD() + "\t@" + s + "\n\tD;JNE\n"
 	if _, err := c.stream.WriteString(asm); err != nil {
 		log.Println(err)
 	}
 }
 
+// writeFunction initializes the local variables of the callee
 func (c *CodeWriter) writeFunction(fnName string, nVars int) {
-	// TODO
+	asm := "(" + fnName + ")\n"
+	for i := 0; i < nVars; i++ {
+		asm += constD("0") + pushD() + incrementSP()
+	}
+	if _, err := c.stream.WriteString(asm); err != nil {
+		log.Println(err)
+	}
 }
 
+// writeCall saves the frame of the caller (on the satck) and jumps to execute the called function
 func (c *CodeWriter) writeCall(fnName string, nArgs int) {
-	// TODO
+	// push returnAddr
+	asm := "\t@" + fnName + "$ret" + strconv.Itoa(c.retCount) + "\n\tD=A\n" + pushD() + incrementSP()
+
+	// push LCL, ARG, THIS, THAT
+	asm += "\t@LCL\n\tD=M\n" + pushD() + incrementSP() + "\t@ARG\n\tD=M\n" + pushD() + incrementSP() +
+		"\t@THIS\n\tD=M\n" + pushD() + incrementSP() + "\t@THAT\n\tD=M\n" + pushD() + incrementSP()
+
+	// ARG = SP-5-nArgs
+	asm += "\t@" + strconv.Itoa(5+nArgs) + "\n\tD=A\n\t@SP\n\tD=M-D\n\t@ARG\n\tM=D\n"
+	// LCL=SP
+	asm += "\t@SP\n\tD=M\n\t@LCL\n\tM=D\n"
+
+	// goto function
+	asm += "\t@" + fnName + "\n\t0;JMP\n"
+	// ( returnAddr )
+	asm += "(" + fnName + "$ret" + strconv.Itoa(c.retCount) + ")\n"
+
+	c.retCount++
+	if _, err := c.stream.WriteString(asm); err != nil {
+		log.Println(err)
+	}
 }
 
+// writeReturn copies the return value to the top of the caller's working stack, reinstates the segment pointers of the caller, and jumps to the returnAddress in the caller
 func (c *CodeWriter) writeReturn() {
-	// TODO
+	// frame = LCL
+	asm := "\t@LCL\n\tD=A\n\tD=M\n\t@frame\n\tM=D\n"
+	// retAddr = *(frame-5)
+	asm += constD("5") + "\t@frame\n\tD=M-D\n\tA=D\n\tD=M\n\t@retAddr\n\tM=D\n"
+	// *ARG = pop()
+	asm += popD() + "\t@ARG\n\tA=M\n\tM=D\n"
+	// SP = ARG + 1
+	asm += "\t@ARG\n\tD=M+1\n\t@SP\n\tM=D\n"
+
+	// THAT = *(frame-1)
+	asm += constD("1") + "\t@frame\n\tD=M-D\n\tA=D\n\tD=M\n\t@THAT\n\tM=D\n"
+	// THIS = *(frame-2)
+	asm += constD("2") + "\t@frame\n\tD=M-D\n\tA=D\n\tD=M\n\t@THIS\n\tM=D\n"
+	// ARG = *(frame-3)
+	asm += constD("3") + "\t@frame\n\tD=M-D\n\tA=D\n\tD=M\n\t@ARG\n\tM=D\n"
+	// LCL = *(frame-4)
+	asm += constD("4") + "\t@frame\n\tD=M-D\n\tA=D\n\tD=M\n\t@LCL\n\tM=D\n"
+	// goto retAddr
+	asm += "\t@retAddr\n\tA=M\n\t0;JMP\n"
+	if _, err := c.stream.WriteString(asm); err != nil {
+		log.Println(err)
+	}
+}
+
+// bootstrap the file
+func (c *CodeWriter) bootstrap() {
+	asm := "// initialize program state\n(bootstrap)\n" + constD("256") + "\t@SP\n\tM=D\n" // +
+	if _, err := c.stream.WriteString(asm); err != nil {
+		log.Println(err)
+	}
+	c.writeCall("Sys.init", 0)
 }
 
 // write infinite loop at the end of the asm file
@@ -325,8 +408,7 @@ func staticD(s string) string {
 }
 
 func pop2(s string) string {
-	phrase := "\t@SP\n\tM=M-1\n\tA=M\n\tD=M\n" +
-		"\t@SP\n\tM=M-1\n\tA=M\n"
+	phrase := popD() + decrementSP() + "\tA=M\n"
 	switch {
 	case s == "add":
 		phrase += "\tD=M+D\n"
